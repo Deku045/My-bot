@@ -1,7 +1,8 @@
+
 import os
+import re
 import logging
 import subprocess
-import json
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
@@ -28,15 +29,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_video_duration(filepath):
-    """يرجع مدة الفيديو بالثواني باستخدام ffprobe"""
-    command = [
-        'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'json', filepath
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    data = json.loads(result.stdout)
-    return float(data['format']['duration'])
+    """يرجع مدة الفيديو بالثواني، بيقرأها من مخرجات ffmpeg نفسه (بدون الحاجة لـ ffprobe)"""
+    command = ['ffmpeg', '-i', filepath]
+    # ffmpeg بيطبع معلومات الملف على stderr ويرجع كود خروج غير صفري لو مفيش output،
+    # فمش هنستخدم check=True هنا
+    result = subprocess.run(command, capture_output=True, text=True)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if not match:
+        raise RuntimeError("مش قادر أحدد مدة الفيديو من مخرجات ffmpeg")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def calculate_clip_start_times(total_duration, num_clips, clip_duration, edge_margin):
