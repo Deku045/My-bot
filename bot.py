@@ -20,12 +20,12 @@ def download_and_cut_video(youtube_url, output_filename="short_output.mp4"):
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
         'outtmpl': 'full_video.mp4',
         'max_filesize': 100 * 1024 * 1024,
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
 
-    # قص 30 ثانية (من الثانية 10 إلى 40) وتحويله إلى مقاس الشورتس العمودي 9:16
     command = [
         'ffmpeg', '-y', '-i', 'full_video.mp4',
         '-ss', '10', '-to', '40',
@@ -34,6 +34,45 @@ def download_and_cut_video(youtube_url, output_filename="short_output.mp4"):
         output_filename
     ]
     subprocess.run(command, check=True)
+    
+    if os.path.exists('full_video.mp4'):
+        os.remove('full_video.mp4')
+        
+    return output_filename
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if "youtube.com" in url or "youtu.be" in url:
+        await update.message.reply_text("⏳ جاري تحميل وقص الفيديو، انتظر قليلاً...")
+        
+        try:
+            output_file = download_and_cut_video(url)
+            
+            await update.message.reply_video(video=open(output_file, 'rb'))
+            
+            if os.path.exists(output_file):
+                os.remove(output_file)
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ أثناء معالجة الفيديو: {str(e)}")
+    else:
+        await update.message.reply_text("❌ الرجاء إرسال رابط يوتيوب صحيح.")
+
+def main():
+    if not TOKEN:
+        print("Error: TELEGRAM_TOKEN is not set.")
+        return
+
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    print("Bot is starting...")
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
     
     if os.path.exists('full_video.mp4'):
         os.remove('full_video.mp4')
