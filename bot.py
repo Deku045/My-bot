@@ -5,6 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
 
+# إعداد الـ Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -27,7 +28,7 @@ def download_and_cut_video(youtube_url, output_filename="short_output.mp4"):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
 
-    # أمر سريع لقص أول 30 ثانية وتحويل المقاس
+    # أمر FFmpeg لقص 30 ثانية (من الثانية 10 إلى 40) وتحويل المقاس
     command = [
         'ffmpeg', '-y', '-i', 'full_video.mp4',
         '-ss', '10', '-to', '40',
@@ -37,84 +38,7 @@ def download_and_cut_video(youtube_url, output_filename="short_output.mp4"):
     ]
     subprocess.run(command, check=True)
     
-    if os.path.exists('full_video.mp4'):
-        os.remove('full_video.mp4')
-        
-    return output_filename
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    if "youtube.com" in url or "youtu.be" in url:
-        waiting_msg = await update.message.reply_text("⏳ جاري معالجة الفيديو بسرعة...")
-        
-        try:
-            output_file = download_and_cut_video(url)
-            
-            await update.message.reply_video(video=open(output_file, 'rb'))
-            
-            if os.path.exists(output_file):
-                os.remove(output_file)
-                
-        except Exception as e:
-            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
-    else:
-        await update.message.reply_text("❌ يرجى إرسال رابط يوتيوب صالح.")
-
-def main():
-    if not TOKEN:
-        print("Error: TELEGRAM_TOKEN is not set.")
-        return
-
-    application = ApplicationBuilder().token(TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    print("Bot is starting...")
-    application.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()
-    
-    if os.path.exists('full_video.mp4'):
-        os.remove('full_video.mp4')
-        
-    return output_filename
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text
-    if "youtube.com" in url or "youtu.be" in url:
-        await update.message.reply_text("⏳ جاري تحميل وقص الفيديو، انتظر قليلاً...")
-        
-        try:
-            output_file = download_and_cut_video(url)
-            
-            await update.message.reply_video(video=open(output_file, 'rb'))
-            
-            if os.path.exists(output_file):
-                os.remove(output_file)
-                
-        except Exception as e:
-            await update.message.reply_text(f"❌ حدث خطأ أثناء معالجة الفيديو: {str(e)}")
-    else:
-        await update.message.reply_text("❌ الرجاء إرسال رابط يوتيوب صحيح.")
-
-def main():
-    if not TOKEN:
-        print("Error: TELEGRAM_TOKEN is not set.")
-        return
-
-    application = ApplicationBuilder().token(TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    print("Bot is starting...")
-    application.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()
-    
+    # حذف الفيديو الأصلي بعد القص
     if os.path.exists('full_video.mp4'):
         os.remove('full_video.mp4')
         
@@ -128,9 +52,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             output_file = download_and_cut_video(url)
             
-            # إرسال الفيديو القصير الناتج للمستخدم
-            await update.message.reply_video(video=open(output_file, 'rb'))
+            # إرسال الفيديو الناتج للمستخدم
+            with open(output_file, 'rb') as video_file:
+                await update.message.reply_video(video=video_file)
             
+            # حذف الفيديو المقصوص بعد الإرسال
             if os.path.exists(output_file):
                 os.remove(output_file)
                 
@@ -154,4 +80,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
