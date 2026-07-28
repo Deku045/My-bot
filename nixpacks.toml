@@ -1,9 +1,0 @@
-[phases.setup]
-nixPkgs = ["python3", "ffmpeg-full"]
-
-[phases.build]
-cmds = ["pip install -r requirements.txt"]
-
-[start]
-cmd = "python bot.py"
-RAILPACK_DEPLOY_APT_PACKAGES = 'ffmpeg'
