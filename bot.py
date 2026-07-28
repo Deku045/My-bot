@@ -2,8 +2,6 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-import yt_dlp
-import subprocess
 
 # Enable logging
 logging.basicConfig(
@@ -34,6 +32,12 @@ def main():
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    print("Bot is starting...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
     
     print("Bot is starting...")
     application.run_polling()
