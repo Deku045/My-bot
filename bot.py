@@ -1,9 +1,9 @@
 import os
 import logging
-import subprocess
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
+import subprocess
 
 # Enable logging
 logging.basicConfig(
@@ -15,25 +15,31 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello! Send me a YouTube link, and I will process it into a short clip for you 🎬"
+        "أهلاً بك يا محمد! بوت استخراج الشورتس متصل وجاهز للعمل 🎬\nأرسل لي الآن رابط يوتيوب لنبدأ التجربة!"
     )
 
-def download_and_cut_video(youtube_url, output_filename="short_output.mp4"):
-    # 1. Download a short segment or low-res version to save server space/time
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
-        'outtmpl': 'full_video.mp4',
-        'max_filesize': 100 * 1024 * 1024, # Limit to 100MB for safety on free tiers
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if "youtube.com" in url or "youtu.be" in url:
+        await update.message.reply_text("⏳ تم استلام رابط يوتيوب بنجاح! جاري معالجة الفيديو...")
+    else:
+        await update.message.reply_text("❌ الرجاء إرسال رابط يوتيوب صحيح.")
 
-    # 2. Use FFmpeg to cut a 30-second clip (e.g., from second 10 to 40) and crop to vertical 9:16
-    command = [
-        'ffmpeg', '-y', '-i', 'full_video.mp4',
-        '-ss', '10', '-to', '40',
-        '-vf', "crop=ih*(9/16):ih,scale=1080:1920",
+def main():
+    if not TOKEN:
+        print("Error: TELEGRAM_TOKEN is not set.")
+        return
+
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    print("Bot is starting...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
         '-c:v', 'libx264', '-c:a', 'aac',
         output_filename
     ]
