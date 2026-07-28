@@ -1,8 +1,9 @@
-
 import os
 import re
+import json
 import logging
 import subprocess
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
@@ -12,19 +13,29 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
 
 # ==== إعدادات قابلة للتعديل ====
 NUM_CLIPS = 5          # عدد الشورتات المطلوب إنتاجها من كل فيديو
-CLIP_DURATION = 30     # مدة كل مقطع بالثواني
+CLIP_DURATION = 30     # مدة كل مقطع بالثواني (الحد الأقصى)
+MIN_CLIP_DURATION = 15  # الحد الأدنى لمدة المقطع
 EDGE_MARGIN = 5         # هامش بالثواني نتجنبه من أول وآخر الفيديو (انترو/آوترو غالباً)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = "🧠 هختار أقوى اللحظات بالذكاء الاصطناعي" if GROQ_API_KEY else "✂️ تقسيم بالتساوي"
     await update.message.reply_text(
         "أهلاً بك يا محمد! بوت قص الفيديوهات جاهز 🎬\n"
-        f"أرسل رابط يوتيوب وهقصّلك {NUM_CLIPS} شورتات منه!"
+        f"أرسل رابط يوتيوب وهقصّلك {NUM_CLIPS} شورتات منه!\n"
+        f"الوضع الحالي: {mode}"
     )
 
 
@@ -57,6 +68,80 @@ def calculate_clip_start_times(total_duration, num_clips, clip_duration, edge_ma
     return [round(usable_start + i * step, 2) for i in range(num_clips)]
 
 
+def extract_audio(video_path, audio_path="audio.mp3"):
+    """يستخرج الصوت من الفيديو كملف mp3 صغير الحجم (مونو، بيتريت منخفض) عشان يدخل في حد حجم API"""
+    command = [
+        'ffmpeg', '-y', '-i', video_path,
+        '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',
+        audio_path
+    ]
+    subprocess.run(command, check=True)
+    return audio_path
+
+
+def transcribe_audio(audio_path):
+    """يبعت الصوت لـ Groq Whisper ويرجع النص مع توقيت كل جزء (segments)"""
+    with open(audio_path, 'rb') as f:
+        response = requests.post(
+            GROQ_TRANSCRIBE_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (os.path.basename(audio_path), f, "audio/mpeg")},
+            data={
+                "model": GROQ_WHISPER_MODEL,
+                "response_format": "verbose_json",
+            },
+            timeout=180,
+        )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("segments", [])
+
+
+def find_best_moments(segments, total_duration, num_clips, clip_duration, min_clip_duration):
+    """يبعت الترانسكريبت لموديل Llama على Groq عشان يحدد أقوى اللحظات (بداية/نهاية بالثانية)"""
+    transcript_text = "\n".join(
+        f"[{seg['start']:.1f}-{seg['end']:.1f}] {seg['text'].strip()}"
+        for seg in segments
+    )
+
+    system_prompt = (
+        "أنت خبير في تحرير الفيديوهات القصيرة (شورتس) الفيروسية. "
+        "هيُعطى لك ترانسكريبت لفيديو مع توقيت كل جملة بالثواني. "
+        f"مهمتك: اختَر أفضل {num_clips} لحظات 'ضاربة' (مشوّقة، مفاجئة، عاطفية، أو فيها معلومة قوية) "
+        f"بحيث تكون مدة كل لحظة بين {min_clip_duration} و {clip_duration} ثانية، ولا تتداخل اللحظات مع بعضها. "
+        "رد فقط بصيغة JSON صالحة بدون أي نص إضافي، بالشكل التالي:\n"
+        '{"moments": [{"start": 12.5, "end": 42.0, "reason": "سبب مختصر"}, ...]}'
+    )
+
+    response = requests.post(
+        GROQ_CHAT_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": GROQ_LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"مدة الفيديو الكلية: {total_duration:.1f} ثانية.\n\nالترانسكريبت:\n{transcript_text}"},
+            ],
+            "temperature": 0.4,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    moments = json.loads(content).get("moments", [])
+
+    # تصفية وتنظيف اللحظات المرجعة عشان نتأكد إنها منطقية
+    cleaned = []
+    for m in moments:
+        start = max(0, float(m["start"]))
+        end = min(total_duration, float(m["end"]))
+        if end - start >= 5:  # تجاهل أي لحظة قصيرة جداً بشكل غير منطقي
+            cleaned.append({"start": start, "end": end, "reason": m.get("reason", "")})
+
+    return cleaned[:num_clips]
+
+
 def download_video(youtube_url, output_path="full_video.mp4"):
     ydl_opts = {
         'format': 'mp4/best',
@@ -81,22 +166,61 @@ def cut_clip(source_path, start_time, duration, output_filename):
     return output_filename
 
 
+def get_smart_moments(source_path, total_duration):
+    """يحاول يستخدم Groq (تفريغ صوتي + تحليل) لتحديد أقوى اللحظات. يرجع None لو فشل أو المفتاح غير موجود"""
+    if not GROQ_API_KEY:
+        return None
+
+    audio_path = "audio.mp3"
+    try:
+        extract_audio(source_path, audio_path)
+        segments = transcribe_audio(audio_path)
+        if not segments:
+            logger.warning("Groq: مفيش segments في الترانسكريبت")
+            return None
+
+        moments = find_best_moments(segments, total_duration, NUM_CLIPS, CLIP_DURATION, MIN_CLIP_DURATION)
+        if not moments:
+            logger.warning("Groq: مفيش لحظات صالحة رجعت من التحليل")
+            return None
+
+        return moments
+
+    except Exception as e:
+        logger.warning(f"فشل التحليل الذكي عبر Groq، هنرجع للتقسيم بالتساوي: {e}")
+        return None
+
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+
 def download_and_cut_videos(youtube_url):
-    """يحمّل الفيديو ويقصّه لعدة شورتات، ويرجع قائمة بأسماء الملفات الناتجة"""
+    """يحمّل الفيديو ويقصّه لعدة شورتات (أقوى اللحظات لو متاح، وإلا تقسيم بالتساوي)"""
     source_path = download_video(youtube_url)
     total_duration = get_video_duration(source_path)
 
-    start_times = calculate_clip_start_times(
-        total_duration, NUM_CLIPS, CLIP_DURATION, EDGE_MARGIN
-    )
+    smart_moments = get_smart_moments(source_path, total_duration)
 
     output_files = []
-    for idx, start_time in enumerate(start_times, start=1):
-        # لو الفيديو قصير، خلي مدة القص متناسبة معاه
-        actual_duration = min(CLIP_DURATION, max(1, total_duration - start_time))
-        output_filename = f"short_{idx}.mp4"
-        cut_clip(source_path, start_time, actual_duration, output_filename)
-        output_files.append(output_filename)
+
+    if smart_moments:
+        # الوضع الذكي: نقص اللحظات اللي اختارها التحليل بالظبط
+        for idx, moment in enumerate(smart_moments, start=1):
+            duration = min(CLIP_DURATION, moment["end"] - moment["start"])
+            output_filename = f"short_{idx}.mp4"
+            cut_clip(source_path, moment["start"], duration, output_filename)
+            output_files.append(output_filename)
+    else:
+        # الوضع الاحتياطي: تقسيم بالتساوي على طول الفيديو
+        start_times = calculate_clip_start_times(
+            total_duration, NUM_CLIPS, CLIP_DURATION, EDGE_MARGIN
+        )
+        for idx, start_time in enumerate(start_times, start=1):
+            actual_duration = min(CLIP_DURATION, max(1, total_duration - start_time))
+            output_filename = f"short_{idx}.mp4"
+            cut_clip(source_path, start_time, actual_duration, output_filename)
+            output_files.append(output_filename)
 
     if os.path.exists(source_path):
         os.remove(source_path)
@@ -107,9 +231,8 @@ def download_and_cut_videos(youtube_url):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     if "youtube.com" in url or "youtu.be" in url:
-        msg = await update.message.reply_text(
-            f"⏳ جاري تحميل الفيديو وقص {NUM_CLIPS} شورتات منه، انتظر شوية..."
-        )
+        mode_text = "🧠 بحلل الفيديو وأختار أقوى اللحظات..." if GROQ_API_KEY else f"✂️ جاري تحميل الفيديو وقص {NUM_CLIPS} شورتات بالتساوي..."
+        msg = await update.message.reply_text(f"⏳ {mode_text}")
 
         output_files = []
         try:
