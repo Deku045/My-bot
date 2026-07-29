@@ -28,6 +28,7 @@ NUM_CLIPS = 5          # عدد الشورتات المطلوب إنتاجها �
 CLIP_DURATION = 30     # مدة كل مقطع بالثواني (الحد الأقصى)
 MIN_CLIP_DURATION = 15  # الحد الأدنى لمدة المقطع
 EDGE_MARGIN = 5         # هامش بالثواني نتجنبه من أول وآخر الفيديو (انترو/آوترو غالباً)
+ENABLE_SUBTITLES = True  # حرق سابتيتل تلقائي على الشورتات (يحتاج GROQ_API_KEY)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,11 +155,59 @@ def download_video(youtube_url, output_path="full_video.mp4"):
     return output_path
 
 
-def cut_clip(source_path, start_time, duration, output_filename):
+def seconds_to_srt_time(seconds):
+    """يحول الثواني لصيغة توقيت SRT: HH:MM:SS,mmm"""
+    seconds = max(0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def build_srt_for_clip(segments, clip_start, clip_end, srt_path):
+    """يبني ملف SRT خاص بمقطع معين، بتوقيت نسبي لبداية المقطع (0:00)"""
+    lines = []
+    counter = 1
+    for seg in segments:
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        # نتجاهل أي جزء مش متداخل مع نطاق المقطع
+        if seg_end <= clip_start or seg_start >= clip_end:
+            continue
+
+        # نقص الجزء عشان ميخرجش برة حدود المقطع
+        rel_start = max(seg_start, clip_start) - clip_start
+        rel_end = min(seg_end, clip_end) - clip_start
+        text = seg["text"].strip()
+        if not text:
+            continue
+
+        lines.append(str(counter))
+        lines.append(f"{seconds_to_srt_time(rel_start)} --> {seconds_to_srt_time(rel_end)}")
+        lines.append(text)
+        lines.append("")
+        counter += 1
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return srt_path if counter > 1 else None
+
+
+def cut_clip(source_path, start_time, duration, output_filename, srt_path=None):
+    video_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
+
+    if srt_path:
+        # نهرب المسار عشان فلتر ffmpeg، ونحدد ستايل السابتيتل (خط سميك أبيض بحدود سودة، تحت الشاشة)
+        escaped_path = srt_path.replace('\\', '\\\\').replace(':', '\\:')
+        style = "FontName=Arial,FontSize=13,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=60,Bold=1"
+        video_filter += f",subtitles='{escaped_path}':force_style='{style}'"
+
     command = [
         'ffmpeg', '-y', '-i', source_path,
         '-ss', str(start_time), '-t', str(duration),
-        '-vf', "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+        '-vf', video_filter,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
         output_filename
     ]
@@ -166,8 +215,8 @@ def cut_clip(source_path, start_time, duration, output_filename):
     return output_filename
 
 
-def get_smart_moments(source_path, total_duration):
-    """يحاول يستخدم Groq (تفريغ صوتي + تحليل) لتحديد أقوى اللحظات. يرجع None لو فشل أو المفتاح غير موجود"""
+def transcribe_video(source_path):
+    """يستخرج الصوت من الفيديو ويرجع segments من Groq Whisper. يرجع None لو المفتاح غير موجود أو حصل خطأ"""
     if not GROQ_API_KEY:
         return None
 
@@ -175,55 +224,69 @@ def get_smart_moments(source_path, total_duration):
     try:
         extract_audio(source_path, audio_path)
         segments = transcribe_audio(audio_path)
-        if not segments:
-            logger.warning("Groq: مفيش segments في الترانسكريبت")
-            return None
-
-        moments = find_best_moments(segments, total_duration, NUM_CLIPS, CLIP_DURATION, MIN_CLIP_DURATION)
-        if not moments:
-            logger.warning("Groq: مفيش لحظات صالحة رجعت من التحليل")
-            return None
-
-        return moments
-
+        return segments if segments else None
     except Exception as e:
-        logger.warning(f"فشل التحليل الذكي عبر Groq، هنرجع للتقسيم بالتساوي: {e}")
+        logger.warning(f"فشل التفريغ الصوتي عبر Groq: {e}")
         return None
-
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
 
+def get_smart_moments(segments, total_duration):
+    """يحاول يحدد أقوى اللحظات من الترانسكريبت. يرجع None لو فشل أو مفيش ترانسكريبت"""
+    if not segments:
+        return None
+    try:
+        moments = find_best_moments(segments, total_duration, NUM_CLIPS, CLIP_DURATION, MIN_CLIP_DURATION)
+        return moments or None
+    except Exception as e:
+        logger.warning(f"فشل التحليل الذكي عبر Groq، هنرجع للتقسيم بالتساوي: {e}")
+        return None
+
+
 def download_and_cut_videos(youtube_url):
-    """يحمّل الفيديو ويقصّه لعدة شورتات (أقوى اللحظات لو متاح، وإلا تقسيم بالتساوي)"""
+    """يحمّل الفيديو ويقصّه لعدة شورتات (أقوى اللحظات لو متاح، وإلا تقسيم بالتساوي)، مع سابتيتل لو متاح"""
     source_path = download_video(youtube_url)
     total_duration = get_video_duration(source_path)
 
-    smart_moments = get_smart_moments(source_path, total_duration)
+    segments = transcribe_video(source_path)
+    smart_moments = get_smart_moments(segments, total_duration)
 
-    output_files = []
-
+    # نحدد نطاقات المقاطع (بداية، مدة) سواء من التحليل الذكي أو التقسيم بالتساوي
     if smart_moments:
-        # الوضع الذكي: نقص اللحظات اللي اختارها التحليل بالظبط
-        for idx, moment in enumerate(smart_moments, start=1):
-            duration = min(CLIP_DURATION, moment["end"] - moment["start"])
-            output_filename = f"short_{idx}.mp4"
-            cut_clip(source_path, moment["start"], duration, output_filename)
-            output_files.append(output_filename)
+        clip_ranges = [
+            (m["start"], min(CLIP_DURATION, m["end"] - m["start"]))
+            for m in smart_moments
+        ]
     else:
-        # الوضع الاحتياطي: تقسيم بالتساوي على طول الفيديو
         start_times = calculate_clip_start_times(
             total_duration, NUM_CLIPS, CLIP_DURATION, EDGE_MARGIN
         )
-        for idx, start_time in enumerate(start_times, start=1):
-            actual_duration = min(CLIP_DURATION, max(1, total_duration - start_time))
-            output_filename = f"short_{idx}.mp4"
-            cut_clip(source_path, start_time, actual_duration, output_filename)
-            output_files.append(output_filename)
+        clip_ranges = [
+            (start, min(CLIP_DURATION, max(1, total_duration - start)))
+            for start in start_times
+        ]
+
+    output_files = []
+    srt_files = []
+    for idx, (start_time, duration) in enumerate(clip_ranges, start=1):
+        srt_path = None
+        if ENABLE_SUBTITLES and segments:
+            candidate_srt = f"sub_{idx}.srt"
+            srt_path = build_srt_for_clip(segments, start_time, start_time + duration, candidate_srt)
+            if srt_path:
+                srt_files.append(srt_path)
+
+        output_filename = f"short_{idx}.mp4"
+        cut_clip(source_path, start_time, duration, output_filename, srt_path=srt_path)
+        output_files.append(output_filename)
 
     if os.path.exists(source_path):
         os.remove(source_path)
+    for srt_file in srt_files:
+        if os.path.exists(srt_file):
+            os.remove(srt_file)
 
     return output_files
 
