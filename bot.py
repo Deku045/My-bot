@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import logging
 import subprocess
 import requests
@@ -17,6 +18,31 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64")
+
+COOKIES_FILE_PATH = "youtube_cookies.txt"
+
+
+def setup_youtube_cookies():
+    """يفك تشفير الكوكيز من متغير البيئة (لو موجود) ويكتبها في ملف محلي يستخدمه yt-dlp.
+    بيتجاهل تلقائياً أي أسطر زيادة من أدوات زي certutil (BEGIN/END CERTIFICATE)"""
+    if not YOUTUBE_COOKIES_B64:
+        return None
+    try:
+        # نشيل أي سطر مش جزء من الـ base64 نفسه (زي هيدرز certutil) ومسافات فاضية
+        clean_lines = [
+            line.strip() for line in YOUTUBE_COOKIES_B64.splitlines()
+            if line.strip() and not line.strip().startswith('-----')
+        ]
+        clean_b64 = "".join(clean_lines)
+
+        decoded = base64.b64decode(clean_b64)
+        with open(COOKIES_FILE_PATH, "wb") as f:
+            f.write(decoded)
+        return COOKIES_FILE_PATH
+    except Exception as e:
+        logger.warning(f"فشل فك تشفير كوكيز يوتيوب: {e}")
+        return None
 
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -81,7 +107,7 @@ def extract_audio(video_path, audio_path="audio.mp3"):
 
 
 def transcribe_audio(audio_path):
-    """يبعت الصوت لـ Groq Whisper ويرجع النص مع توقيت كل جزء (segments)"""
+    """يبعت الصوت لـ Groq Whisper ويرجع توقيت كل كلمة على حدة (word-level) عشان السابتيتل يبقى متزامن مع الكلام"""
     with open(audio_path, 'rb') as f:
         response = requests.post(
             GROQ_TRANSCRIBE_URL,
@@ -90,12 +116,16 @@ def transcribe_audio(audio_path):
             data={
                 "model": GROQ_WHISPER_MODEL,
                 "response_format": "verbose_json",
+                "timestamp_granularities[]": "word",
             },
             timeout=180,
         )
     response.raise_for_status()
     data = response.json()
-    return data.get("segments", [])
+    return {
+        "segments": data.get("segments", []),
+        "words": data.get("words", []),
+    }
 
 
 def find_best_moments(segments, total_duration, num_clips, clip_duration, min_clip_duration):
@@ -150,6 +180,11 @@ def download_video(youtube_url, output_path="full_video.mp4"):
         'max_filesize': 200 * 1024 * 1024,
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
+
+    cookies_path = setup_youtube_cookies()
+    if cookies_path:
+        ydl_opts['cookiefile'] = cookies_path
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
     return output_path
@@ -165,21 +200,29 @@ def seconds_to_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def build_srt_for_clip(segments, clip_start, clip_end, srt_path):
-    """يبني ملف SRT خاص بمقطع معين، بتوقيت نسبي لبداية المقطع (0:00)"""
+def build_srt_for_clip(words, clip_start, clip_end, srt_path, words_per_group=3):
+    """يبني ملف SRT خاص بمقطع معين، بتوقيت نسبي لبداية المقطع، ومقسّم لمجموعات قصيرة من الكلمات
+    (2-3 كلمات) عشان يبقى متزامن مع الكلام زي شورتس تيك توك/ريلز"""
+    # نفلتر بس الكلمات اللي جوه نطاق المقطع
+    clip_words = [
+        w for w in words
+        if w["end"] > clip_start and w["start"] < clip_end
+    ]
+
+    if not clip_words:
+        return None
+
     lines = []
     counter = 1
-    for seg in segments:
-        seg_start = seg["start"]
-        seg_end = seg["end"]
-        # نتجاهل أي جزء مش متداخل مع نطاق المقطع
-        if seg_end <= clip_start or seg_start >= clip_end:
+    for i in range(0, len(clip_words), words_per_group):
+        group = clip_words[i:i + words_per_group]
+
+        rel_start = max(group[0]["start"], clip_start) - clip_start
+        rel_end = min(group[-1]["end"], clip_end) - clip_start
+        if rel_end <= rel_start:
             continue
 
-        # نقص الجزء عشان ميخرجش برة حدود المقطع
-        rel_start = max(seg_start, clip_start) - clip_start
-        rel_end = min(seg_end, clip_end) - clip_start
-        text = seg["text"].strip()
+        text = " ".join(w["word"].strip() for w in group).strip()
         if not text:
             continue
 
@@ -216,15 +259,16 @@ def cut_clip(source_path, start_time, duration, output_filename, srt_path=None):
 
 
 def transcribe_video(source_path):
-    """يستخرج الصوت من الفيديو ويرجع segments من Groq Whisper. يرجع None لو المفتاح غير موجود أو حصل خطأ"""
+    """يستخرج الصوت من الفيديو ويرجع dict فيه segments (للتحليل) و words (للسابتيتل المتزامن).
+    يرجع None لو المفتاح غير موجود أو حصل خطأ"""
     if not GROQ_API_KEY:
         return None
 
     audio_path = "audio.mp3"
     try:
         extract_audio(source_path, audio_path)
-        segments = transcribe_audio(audio_path)
-        return segments if segments else None
+        result = transcribe_audio(audio_path)
+        return result if result.get("segments") else None
     except Exception as e:
         logger.warning(f"فشل التفريغ الصوتي عبر Groq: {e}")
         return None
@@ -250,7 +294,9 @@ def download_and_cut_videos(youtube_url):
     source_path = download_video(youtube_url)
     total_duration = get_video_duration(source_path)
 
-    segments = transcribe_video(source_path)
+    transcript = transcribe_video(source_path)
+    segments = transcript["segments"] if transcript else None
+    words = transcript["words"] if transcript else None
     smart_moments = get_smart_moments(segments, total_duration)
 
     # نحدد نطاقات المقاطع (بداية، مدة) سواء من التحليل الذكي أو التقسيم بالتساوي
@@ -272,9 +318,9 @@ def download_and_cut_videos(youtube_url):
     srt_files = []
     for idx, (start_time, duration) in enumerate(clip_ranges, start=1):
         srt_path = None
-        if ENABLE_SUBTITLES and segments:
+        if ENABLE_SUBTITLES and words:
             candidate_srt = f"sub_{idx}.srt"
-            srt_path = build_srt_for_clip(segments, start_time, start_time + duration, candidate_srt)
+            srt_path = build_srt_for_clip(words, start_time, start_time + duration, candidate_srt)
             if srt_path:
                 srt_files.append(srt_path)
 
@@ -305,7 +351,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(output_file, 'rb') as video_file:
                     await update.message.reply_video(
                         video=video_file,
-                        caption=f"Short {idx}/{len(output_files)} 🎬"
+                        caption=f"Short {idx}/{len(output_files)} 🎬",
+                        read_timeout=120,
+                        write_timeout=180,
+                        connect_timeout=60,
                     )
 
             await update.message.reply_text("✅ تم! دي كل الشورتات الجاهزة.")
@@ -326,7 +375,15 @@ def main():
     if not TOKEN:
         print("Error: TELEGRAM_TOKEN is not set.")
         return
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(60)
+        .read_timeout(120)
+        .write_timeout(180)
+        .pool_timeout(60)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
