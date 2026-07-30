@@ -2,9 +2,11 @@ import os
 import re
 import json
 import base64
+import sys
 import logging
 import platform
 import subprocess
+import traceback
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -12,13 +14,30 @@ import yt_dlp
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+sys.stderr = sys.stdout
+
+def global_excepthook(exc_type, exc_value, exc_tb):
+    logger.critical(f"UNHANDLED EXCEPTION: {exc_type.__name__}: {exc_value}")
+    logger.critical("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+sys.excepthook = global_excepthook
+
+logger.info(f"Python: {sys.version}")
+logger.info(f"Platform: {platform.system()} {platform.release()}")
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64")
+
+if GROQ_API_KEY:
+    logger.info(f"GROQ_API_KEY is set (len={len(GROQ_API_KEY)})")
+else:
+    logger.warning("GROQ_API_KEY is NOT set - subtitles & AI features disabled")
+if TOKEN:
+    logger.info(f"TELEGRAM_TOKEN is set (len={len(TOKEN)})")
 
 COOKIES_FILE_PATH = "youtube_cookies.txt"
 
