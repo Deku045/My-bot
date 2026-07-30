@@ -3,13 +3,13 @@ import re
 import json
 import base64
 import logging
+import platform
 import subprocess
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import yt_dlp
 
-# إعداد الـ Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -22,71 +22,90 @@ YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64")
 
 COOKIES_FILE_PATH = "youtube_cookies.txt"
 
+MODE_TRENDING = "trending"
+MODE_SPLIT = "split"
 
-def setup_youtube_cookies():
-    """يفك تشفير الكوكيز من متغير البيئة (لو موجود) ويكتبها في ملف محلي يستخدمه yt-dlp.
-    بيتجاهل تلقائياً أي أسطر زيادة من أدوات زي certutil (BEGIN/END CERTIFICATE)"""
-    if not YOUTUBE_COOKIES_B64:
-        return None
-    try:
-        # نشيل أي سطر مش جزء من الـ base64 نفسه (زي هيدرز certutil) ومسافات فاضية
-        clean_lines = [
-            line.strip() for line in YOUTUBE_COOKIES_B64.splitlines()
-            if line.strip() and not line.strip().startswith('-----')
-        ]
-        clean_b64 = "".join(clean_lines)
-
-        decoded = base64.b64decode(clean_b64)
-        with open(COOKIES_FILE_PATH, "wb") as f:
-            f.write(decoded)
-        return COOKIES_FILE_PATH
-    except Exception as e:
-        logger.warning(f"فشل فك تشفير كوكيز يوتيوب: {e}")
-        return None
+user_modes = {}
 
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
 
-# ==== إعدادات قابلة للتعديل ====
-NUM_CLIPS = 5          # عدد الشورتات المطلوب إنتاجها من كل فيديو
-CLIP_DURATION = 30     # مدة كل مقطع بالثواني (الحد الأقصى)
-MIN_CLIP_DURATION = 15  # الحد الأدنى لمدة المقطع
-EDGE_MARGIN = 5         # هامش بالثواني نتجنبه من أول وآخر الفيديو (انترو/آوترو غالباً)
-ENABLE_SUBTITLES = True  # حرق سابتيتل تلقائي على الشورتات (يحتاج GROQ_API_KEY)
+NUM_CLIPS = 5
+CLIP_DURATION = 30
+MIN_CLIP_DURATION = 15
+EDGE_MARGIN = 5
+ENABLE_SUBTITLES = True
+
+
+def setup_youtube_cookies():
+    if not YOUTUBE_COOKIES_B64:
+        return None
+    try:
+        clean_lines = [
+            line.strip() for line in YOUTUBE_COOKIES_B64.splitlines()
+            if line.strip() and not line.strip().startswith('-----')
+        ]
+        clean_b64 = "".join(clean_lines)
+        decoded = base64.b64decode(clean_b64)
+        with open(COOKIES_FILE_PATH, "wb") as f:
+            f.write(decoded)
+        return COOKIES_FILE_PATH
+    except Exception as e:
+        logger.warning(f"YouTube cookies decode failed: {e}")
+        return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = "🧠 هختار أقوى اللحظات بالذكاء الاصطناعي" if GROQ_API_KEY else "✂️ تقسيم بالتساوي"
     await update.message.reply_text(
-        "أهلاً بك يا محمد! بوت قص الفيديوهات جاهز 🎬\n"
-        f"أرسل رابط يوتيوب وهقصّلك {NUM_CLIPS} شورتات منه!\n"
-        f"الوضع الحالي: {mode}"
+        "أهلاً بك يا محمد! بوت قص الفيديوهات جاهز 🎬\n\n"
+        "أرسل رابط يوتيوب لأبدأ العمل.\n\n"
+        "الأوامر المتاحة:\n"
+        "🔹 /trending  -  AI يختار أقوى اللحظات (افتراضي)\n"
+        "🔹 /split     -  تقسيم الفيديو كاملاً إلى شورتات\n"
+        "🔹 /set_clips 10  -  تغيير عدد الشورتات"
     )
 
 
+async def set_trending_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_modes[update.effective_user.id] = MODE_TRENDING
+    await update.message.reply_text("✅ وضع Trending: AI سيختار أقوى اللحظات!")
+
+
+async def set_split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_modes[update.effective_user.id] = MODE_SPLIT
+    await update.message.reply_text("✅ وضع Split: سيتم تقسيم الفيديو كاملاً!")
+
+
+async def set_clips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        num = int(context.args[0])
+        if 1 <= num <= 50:
+            context.user_data["num_clips"] = num
+            await update.message.reply_text(f"✅ تم تعيين عدد الشورتات إلى {num}")
+        else:
+            await update.message.reply_text("❌ الرجاء إدخال رقم بين 1 و 50")
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح. مثال: /set_clips 10")
+
+
 def get_video_duration(filepath):
-    """يرجع مدة الفيديو بالثواني، بيقرأها من مخرجات ffmpeg نفسه (بدون الحاجة لـ ffprobe)"""
     command = ['ffmpeg', '-i', filepath]
-    # ffmpeg بيطبع معلومات الملف على stderr ويرجع كود خروج غير صفري لو مفيش output،
-    # فمش هنستخدم check=True هنا
     result = subprocess.run(command, capture_output=True, text=True)
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
     if not match:
-        raise RuntimeError("مش قادر أحدد مدة الفيديو من مخرجات ffmpeg")
+        raise RuntimeError("Could not parse video duration from ffmpeg output")
     hours, minutes, seconds = match.groups()
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def calculate_clip_start_times(total_duration, num_clips, clip_duration, edge_margin):
-    """يحسب أوقات بداية المقاطع موزعة بالتساوي على طول الفيديو"""
     usable_start = edge_margin
     usable_end = max(edge_margin, total_duration - edge_margin - clip_duration)
 
     if usable_end <= usable_start:
-        # فيديو قصير جداً: مقطع واحد بس من البداية
-        return [0]
+        return [usable_start]
 
     if num_clips == 1:
         return [usable_start]
@@ -95,19 +114,30 @@ def calculate_clip_start_times(total_duration, num_clips, clip_duration, edge_ma
     return [round(usable_start + i * step, 2) for i in range(num_clips)]
 
 
+def calculate_full_split(total_duration, clip_duration):
+    clips = []
+    start = EDGE_MARGIN
+    while start < total_duration - EDGE_MARGIN:
+        remaining = total_duration - start
+        dur = min(clip_duration, remaining)
+        if dur < MIN_CLIP_DURATION:
+            break
+        clips.append((start, dur))
+        start += dur
+    return clips
+
+
 def extract_audio(video_path, audio_path="audio.mp3"):
-    """يستخرج الصوت من الفيديو كملف mp3 صغير الحجم (مونو، بيتريت منخفض) عشان يدخل في حد حجم API"""
     command = [
         'ffmpeg', '-y', '-i', video_path,
         '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',
         audio_path
     ]
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, capture_output=True)
     return audio_path
 
 
 def transcribe_audio(audio_path):
-    """يبعت الصوت لـ Groq Whisper ويرجع توقيت كل كلمة على حدة (word-level) عشان السابتيتل يبقى متزامن مع الكلام"""
     with open(audio_path, 'rb') as f:
         response = requests.post(
             GROQ_TRANSCRIBE_URL,
@@ -129,7 +159,6 @@ def transcribe_audio(audio_path):
 
 
 def find_best_moments(segments, total_duration, num_clips, clip_duration, min_clip_duration):
-    """يبعت الترانسكريبت لموديل Llama على Groq عشان يحدد أقوى اللحظات (بداية/نهاية بالثانية)"""
     transcript_text = "\n".join(
         f"[{seg['start']:.1f}-{seg['end']:.1f}] {seg['text'].strip()}"
         for seg in segments
@@ -160,14 +189,18 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
     )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
-    moments = json.loads(content).get("moments", [])
 
-    # تصفية وتنظيف اللحظات المرجعة عشان نتأكد إنها منطقية
+    try:
+        moments = json.loads(content).get("moments", [])
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse Groq JSON response: {e}")
+        return []
+
     cleaned = []
     for m in moments:
         start = max(0, float(m["start"]))
         end = min(total_duration, float(m["end"]))
-        if end - start >= 5:  # تجاهل أي لحظة قصيرة جداً بشكل غير منطقي
+        if end - start >= min_clip_duration:
             cleaned.append({"start": start, "end": end, "reason": m.get("reason", "")})
 
     return cleaned[:num_clips]
@@ -177,7 +210,7 @@ def download_video(youtube_url, output_path="full_video.mp4"):
     ydl_opts = {
         'format': 'mp4/best',
         'outtmpl': output_path,
-        'max_filesize': 200 * 1024 * 1024,
+        'max_filesize': 500 * 1024 * 1024,
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
 
@@ -191,7 +224,6 @@ def download_video(youtube_url, output_path="full_video.mp4"):
 
 
 def seconds_to_srt_time(seconds):
-    """يحول الثواني لصيغة توقيت SRT: HH:MM:SS,mmm"""
     seconds = max(0, seconds)
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -201,14 +233,10 @@ def seconds_to_srt_time(seconds):
 
 
 def build_srt_for_clip(words, clip_start, clip_end, srt_path, words_per_group=3):
-    """يبني ملف SRT خاص بمقطع معين، بتوقيت نسبي لبداية المقطع، ومقسّم لمجموعات قصيرة من الكلمات
-    (2-3 كلمات) عشان يبقى متزامن مع الكلام زي شورتس تيك توك/ريلز"""
-    # نفلتر بس الكلمات اللي جوه نطاق المقطع
     clip_words = [
         w for w in words
         if w["end"] > clip_start and w["start"] < clip_end
     ]
-
     if not clip_words:
         return None
 
@@ -216,98 +244,137 @@ def build_srt_for_clip(words, clip_start, clip_end, srt_path, words_per_group=3)
     counter = 1
     for i in range(0, len(clip_words), words_per_group):
         group = clip_words[i:i + words_per_group]
-
         rel_start = max(group[0]["start"], clip_start) - clip_start
         rel_end = min(group[-1]["end"], clip_end) - clip_start
         if rel_end <= rel_start:
             continue
-
         text = " ".join(w["word"].strip() for w in group).strip()
         if not text:
             continue
-
         lines.append(str(counter))
         lines.append(f"{seconds_to_srt_time(rel_start)} --> {seconds_to_srt_time(rel_end)}")
         lines.append(text)
         lines.append("")
         counter += 1
 
+    if counter <= 1:
+        return None
+
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    return srt_path if counter > 1 else None
+    logger.info(f"SRT created (words): {srt_path} - {counter - 1} entries")
+    return srt_path
+
+
+def build_srt_from_segments(segments, clip_start, clip_end, srt_path):
+    clip_segments = [
+        s for s in segments
+        if s["end"] > clip_start and s["start"] < clip_end
+    ]
+    if not clip_segments:
+        return None
+
+    lines = []
+    for idx, seg in enumerate(clip_segments, start=1):
+        rel_start = max(seg["start"], clip_start) - clip_start
+        rel_end = min(seg["end"], clip_end) - clip_start
+        if rel_end <= rel_start:
+            continue
+        text = seg["text"].strip()
+        if not text:
+            continue
+        lines.append(str(idx))
+        lines.append(f"{seconds_to_srt_time(rel_start)} --> {seconds_to_srt_time(rel_end)}")
+        lines.append(text)
+        lines.append("")
+
+    if len(lines) < 4:
+        return None
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    logger.info(f"SRT created (segments): {srt_path}")
+    return srt_path
 
 
 def cut_clip(source_path, start_time, duration, output_filename, srt_path=None):
     video_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
 
     if srt_path:
-        # نهرب المسار عشان فلتر ffmpeg، ونحدد ستايل السابتيتل (خط سميك أبيض بحدود سودة، تحت الشاشة)
-        escaped_path = srt_path.replace('\\', '\\\\').replace(':', '\\:')
+        if platform.system() == "Windows":
+            escaped_path = srt_path.replace('\\', '/').replace(':', '\\:')
+        else:
+            escaped_path = srt_path.replace(':', '\\:')
         style = "FontName=Arial,FontSize=13,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=60,Bold=1"
         video_filter += f",subtitles='{escaped_path}':force_style='{style}'"
 
     command = [
-        'ffmpeg', '-y', '-i', source_path,
-        '-ss', str(start_time), '-t', str(duration),
+        'ffmpeg', '-y',
+        '-ss', str(start_time), '-i', source_path,
+        '-t', str(duration),
         '-vf', video_filter,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
         output_filename
     ]
-    subprocess.run(command, check=True)
+
+    logger.info(f"Cutting clip: start={start_time}, duration={duration}, srt={srt_path}")
+    subprocess.run(command, check=True, capture_output=True)
     return output_filename
 
 
 def transcribe_video(source_path):
-    """يستخرج الصوت من الفيديو ويرجع dict فيه segments (للتحليل) و words (للسابتيتل المتزامن).
-    يرجع None لو المفتاح غير موجود أو حصل خطأ"""
     if not GROQ_API_KEY:
         return None
-
     audio_path = "audio.mp3"
     try:
         extract_audio(source_path, audio_path)
         result = transcribe_audio(audio_path)
-        return result if result.get("segments") else None
+        if result.get("segments"):
+            return result
+        return None
     except Exception as e:
-        logger.warning(f"فشل التفريغ الصوتي عبر Groq: {e}")
+        logger.warning(f"Transcription failed via Groq: {e}")
         return None
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
 
-def get_smart_moments(segments, total_duration):
-    """يحاول يحدد أقوى اللحظات من الترانسكريبت. يرجع None لو فشل أو مفيش ترانسكريبت"""
+def get_smart_moments(segments, total_duration, num_clips):
     if not segments:
         return None
     try:
-        moments = find_best_moments(segments, total_duration, NUM_CLIPS, CLIP_DURATION, MIN_CLIP_DURATION)
+        moments = find_best_moments(segments, total_duration, num_clips, CLIP_DURATION, MIN_CLIP_DURATION)
         return moments or None
     except Exception as e:
-        logger.warning(f"فشل التحليل الذكي عبر Groq، هنرجع للتقسيم بالتساوي: {e}")
+        logger.warning(f"Smart analysis failed, falling back to equal split: {e}")
         return None
 
 
-def download_and_cut_videos(youtube_url):
-    """يحمّل الفيديو ويقصّه لعدة شورتات (أقوى اللحظات لو متاح، وإلا تقسيم بالتساوي)، مع سابتيتل لو متاح"""
+def download_and_cut_videos(youtube_url, user_id=None, num_clips=NUM_CLIPS, mode=MODE_TRENDING):
     source_path = download_video(youtube_url)
     total_duration = get_video_duration(source_path)
 
     transcript = transcribe_video(source_path)
     segments = transcript["segments"] if transcript else None
     words = transcript["words"] if transcript else None
-    smart_moments = get_smart_moments(segments, total_duration)
 
-    # نحدد نطاقات المقاطع (بداية، مدة) سواء من التحليل الذكي أو التقسيم بالتساوي
+    smart_moments = None
+    if mode == MODE_TRENDING and segments:
+        smart_moments = get_smart_moments(segments, total_duration, num_clips)
+
     if smart_moments:
         clip_ranges = [
             (m["start"], min(CLIP_DURATION, m["end"] - m["start"]))
             for m in smart_moments
         ]
+    elif mode == MODE_SPLIT:
+        clip_ranges = calculate_full_split(total_duration, CLIP_DURATION)
     else:
         start_times = calculate_clip_start_times(
-            total_duration, NUM_CLIPS, CLIP_DURATION, EDGE_MARGIN
+            total_duration, num_clips, CLIP_DURATION, EDGE_MARGIN
         )
         clip_ranges = [
             (start, min(CLIP_DURATION, max(1, total_duration - start)))
@@ -318,9 +385,12 @@ def download_and_cut_videos(youtube_url):
     srt_files = []
     for idx, (start_time, duration) in enumerate(clip_ranges, start=1):
         srt_path = None
-        if ENABLE_SUBTITLES and words:
+        if ENABLE_SUBTITLES and (words or segments):
             candidate_srt = f"sub_{idx}.srt"
-            srt_path = build_srt_for_clip(words, start_time, start_time + duration, candidate_srt)
+            if words:
+                srt_path = build_srt_for_clip(words, start_time, start_time + duration, candidate_srt)
+            if not srt_path and segments:
+                srt_path = build_srt_from_segments(segments, start_time, start_time + duration, candidate_srt)
             if srt_path:
                 srt_files.append(srt_path)
 
@@ -340,12 +410,16 @@ def download_and_cut_videos(youtube_url):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     if "youtube.com" in url or "youtu.be" in url:
-        mode_text = "🧠 بحلل الفيديو وأختار أقوى اللحظات..." if GROQ_API_KEY else f"✂️ جاري تحميل الفيديو وقص {NUM_CLIPS} شورتات بالتساوي..."
-        msg = await update.message.reply_text(f"⏳ {mode_text}")
+        user_id = update.effective_user.id
+        mode = user_modes.get(user_id, MODE_TRENDING)
+        num_clips = context.user_data.get("num_clips", NUM_CLIPS)
+
+        mode_text = "🧠 AI يختار أقوى اللحظات..." if mode == MODE_TRENDING else "✂️ تقسيم الفيديو كاملاً..."
+        msg = await update.message.reply_text(f"⏳ جاري التحميل...\n{mode_text}")
 
         output_files = []
         try:
-            output_files = download_and_cut_videos(url)
+            output_files = download_and_cut_videos(url, user_id, num_clips, mode)
 
             for idx, output_file in enumerate(output_files, start=1):
                 with open(output_file, 'rb') as video_file:
@@ -357,13 +431,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         connect_timeout=60,
                     )
 
-            await update.message.reply_text("✅ تم! دي كل الشورتات الجاهزة.")
+            await update.message.reply_text(f"✅ تم! {len(output_files)} شورتات جاهزة.")
 
         except Exception as e:
-            await update.message.reply_text(f"❌ حدث خطأ أثناء معالجة الفيديو: {str(e)}")
+            logger.error(f"Error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
 
         finally:
-            # تنظيف كل الملفات الناتجة بعد الإرسال
             for f in output_files:
                 if os.path.exists(f):
                     os.remove(f)
@@ -386,6 +460,9 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("trending", set_trending_mode))
+    application.add_handler(CommandHandler("split", set_split_mode))
+    application.add_handler(CommandHandler("set_clips", set_clips))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     print("Bot is starting...")
