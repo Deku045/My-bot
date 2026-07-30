@@ -162,10 +162,12 @@ def transcribe_audio(audio_path):
             GROQ_TRANSCRIBE_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             files={"file": (os.path.basename(audio_path), f, "audio/mpeg")},
-            data={
-                "model": GROQ_WHISPER_MODEL,
-                "response_format": "verbose_json",
-            },
+            data=[
+                ("model", GROQ_WHISPER_MODEL),
+                ("response_format", "verbose_json"),
+                ("timestamp_granularities[]", "word"),
+                ("timestamp_granularities[]", "segment"),
+            ],
             timeout=180,
         )
     if response.status_code != 200:
@@ -179,10 +181,17 @@ def transcribe_audio(audio_path):
 
 
 def find_best_moments(segments, total_duration, num_clips, clip_duration, min_clip_duration):
-    transcript_text = "\n".join(
+    formatted_lines = [
         f"[{seg['start']:.1f}-{seg['end']:.1f}] {seg['text'].strip()}"
         for seg in segments
-    )
+    ]
+
+    # اختصار النص لو كان أطول من اللازم لتفادي خطأ 413 (تجاوز حد TPM)
+    if len(formatted_lines) > 200:
+        step = len(formatted_lines) / 200
+        formatted_lines = [formatted_lines[int(i * step)] for i in range(200)]
+
+    transcript_text = "\n".join(formatted_lines)
 
     system_prompt = (
         "أنت خبير في تحرير الفيديوهات القصيرة (شورتس) الفيروسية. "
@@ -289,7 +298,7 @@ def build_srt_for_clip(words, clip_start, clip_end, srt_path, words_per_group=3)
     return srt_path
 
 
-def build_srt_from_segments(segments, clip_start, clip_end, srt_path):
+def build_srt_from_segments(segments, clip_start, clip_end, srt_path, max_words_per_group=3):
     clip_segments = [
         s for s in segments
         if s["end"] > clip_start and s["start"] < clip_end
@@ -298,26 +307,49 @@ def build_srt_from_segments(segments, clip_start, clip_end, srt_path):
         return None
 
     lines = []
-    for idx, seg in enumerate(clip_segments, start=1):
-        rel_start = max(seg["start"], clip_start) - clip_start
-        rel_end = min(seg["end"], clip_end) - clip_start
-        if rel_end <= rel_start:
-            continue
-        text = seg["text"].strip()
-        if not text:
-            continue
-        lines.append(str(idx))
-        lines.append(f"{seconds_to_srt_time(rel_start)} --> {seconds_to_srt_time(rel_end)}")
-        lines.append(text)
-        lines.append("")
+    counter = 1
 
-    if len(lines) < 4:
+    for seg in clip_segments:
+        text = seg["text"].strip()
+        words = text.split()
+        if not words:
+            continue
+
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        seg_dur = max(0.5, seg_end - seg_start)
+
+        # نقسم الجملة إلى مجموعات صغيرة من 2-3 كلمات وتوزيع وقت الجملة عليها نسبياً
+        groups = [words[i:i + max_words_per_group] for i in range(0, len(words), max_words_per_group)]
+        group_dur = seg_dur / len(groups)
+
+        for g_idx, group in enumerate(groups):
+            g_start = seg_start + (g_idx * group_dur)
+            g_end = seg_start + ((g_idx + 1) * group_dur)
+
+            rel_start = max(g_start, clip_start) - clip_start
+            rel_end = min(g_end, clip_end) - clip_start
+
+            if rel_end <= rel_start:
+                continue
+
+            g_text = " ".join(group).strip()
+            if not g_text:
+                continue
+
+            lines.append(str(counter))
+            lines.append(f"{seconds_to_srt_time(rel_start)} --> {seconds_to_srt_time(rel_end)}")
+            lines.append(g_text)
+            lines.append("")
+            counter += 1
+
+    if counter <= 1:
         return None
 
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    logger.info(f"SRT created (segments): {srt_path}")
+    logger.info(f"SRT created (smart segment chunks): {srt_path} - {counter - 1} entries")
     return srt_path
 
 
