@@ -146,11 +146,12 @@ def transcribe_audio(audio_path):
             data={
                 "model": GROQ_WHISPER_MODEL,
                 "response_format": "verbose_json",
-                "timestamp_granularities[]": "word",
             },
             timeout=180,
         )
-    response.raise_for_status()
+    if response.status_code != 200:
+        logger.error(f"Groq Transcribe API error: {response.status_code} - {response.text[:500]}")
+        raise RuntimeError(f"Groq transcription failed: {response.status_code}")
     data = response.json()
     return {
         "segments": data.get("segments", []),
@@ -183,17 +184,19 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
                 {"role": "user", "content": f"مدة الفيديو الكلية: {total_duration:.1f} ثانية.\n\nالترانسكريبت:\n{transcript_text}"},
             ],
             "temperature": 0.4,
-            "response_format": {"type": "json_object"},
         },
         timeout=120,
     )
-    response.raise_for_status()
+    if response.status_code != 200:
+        logger.error(f"Groq LLM API error: {response.status_code} - {response.text[:500]}")
+        return []
+
     content = response.json()["choices"][0]["message"]["content"]
 
     try:
         moments = json.loads(content).get("moments", [])
     except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse Groq JSON response: {e}")
+        logger.warning(f"Failed to parse Groq JSON response: {content[:200]}")
         return []
 
     cleaned = []
