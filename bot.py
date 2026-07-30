@@ -306,33 +306,42 @@ def cut_clip(source_path, start_time, duration, output_filename, srt_path=None):
         if platform.system() == "Windows":
             escaped_path = srt_path.replace('\\', '/').replace(':', '\\:')
         else:
-            escaped_path = srt_path.replace(':', '\\:')
-        style = "FontName=Arial,FontSize=13,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=60,Bold=1"
-        video_filter += f",subtitles='{escaped_path}':force_style='{style}'"
+            escaped_path = srt_path
+        style = "FontName=Arial,FontSize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=60,Bold=1"
+        video_filter += f",subtitles={escaped_path}:force_style='{style}'"
 
     command = [
-        'ffmpeg', '-y',
-        '-ss', str(start_time), '-i', source_path,
-        '-t', str(duration),
+        'ffmpeg', '-y', '-i', source_path,
+        '-ss', str(start_time), '-t', str(duration),
         '-vf', video_filter,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
         output_filename
     ]
 
-    logger.info(f"Cutting clip: start={start_time}, duration={duration}, srt={srt_path}")
-    subprocess.run(command, check=True, capture_output=True)
+    logger.info(f"Cutting clip: start={start_time}, duration={duration}, srt={srt_path}, filter={video_filter[:100]}")
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"ffmpeg failed: {result.stderr[:1000]}")
+        raise RuntimeError(f"ffmpeg error: {result.stderr[:200]}")
+    if result.stderr:
+        logger.debug(f"ffmpeg ok: {result.stderr[-300:]}")
     return output_filename
 
 
 def transcribe_video(source_path):
     if not GROQ_API_KEY:
+        logger.info("GROQ_API_KEY not set - subtitles disabled")
         return None
     audio_path = "audio.mp3"
     try:
         extract_audio(source_path, audio_path)
         result = transcribe_audio(audio_path)
-        if result.get("segments"):
+        segments = result.get("segments", [])
+        words = result.get("words", [])
+        logger.info(f"Transcription: {len(segments)} segments, {len(words)} words")
+        if segments:
             return result
+        logger.warning("No segments returned from Groq")
         return None
     except Exception as e:
         logger.warning(f"Transcription failed via Groq: {e}")
@@ -360,6 +369,7 @@ def download_and_cut_videos(youtube_url, user_id=None, num_clips=NUM_CLIPS, mode
     transcript = transcribe_video(source_path)
     segments = transcript["segments"] if transcript else None
     words = transcript["words"] if transcript else None
+    logger.info(f"Transcript data: segments={'yes' if segments else 'no'}, words={'yes' if words else 'no'}")
 
     smart_moments = None
     if mode == MODE_TRENDING and segments:
@@ -383,16 +393,22 @@ def download_and_cut_videos(youtube_url, user_id=None, num_clips=NUM_CLIPS, mode
 
     output_files = []
     srt_files = []
+    logger.info(f"ENABLE_SUBTITLES={ENABLE_SUBTITLES}, has_words={bool(words)}, has_segments={bool(segments)}")
     for idx, (start_time, duration) in enumerate(clip_ranges, start=1):
         srt_path = None
         if ENABLE_SUBTITLES and (words or segments):
             candidate_srt = f"sub_{idx}.srt"
             if words:
                 srt_path = build_srt_for_clip(words, start_time, start_time + duration, candidate_srt)
+                logger.info(f"Clip {idx}: build_srt_for_clip returned {srt_path}")
             if not srt_path and segments:
                 srt_path = build_srt_from_segments(segments, start_time, start_time + duration, candidate_srt)
+                logger.info(f"Clip {idx}: build_srt_from_segments returned {srt_path}")
             if srt_path:
+                logger.info(f"SRT file exists: {os.path.exists(srt_path)}, size: {os.path.getsize(srt_path) if os.path.exists(srt_path) else 0}")
                 srt_files.append(srt_path)
+            else:
+                logger.warning(f"Clip {idx}: No SRT created")
 
         output_filename = f"short_{idx}.mp4"
         cut_clip(source_path, start_time, duration, output_filename, srt_path=srt_path)
