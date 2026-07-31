@@ -60,9 +60,12 @@ ENABLE_SUBTITLES = True
 
 def setup_youtube_cookies():
     if not YOUTUBE_COOKIES_B64:
+        logger.warning("YOUTUBE_COOKIES_B64 is not set")
         return None
     try:
         content = YOUTUBE_COOKIES_B64.strip()
+        decoded_text = None
+
         if "# Netscape HTTP Cookie File" in content or "\t" in content:
             decoded_text = content
         else:
@@ -71,13 +74,28 @@ def setup_youtube_cookies():
                 if line.strip() and not line.strip().startswith('-----')
             ]
             clean_b64 = "".join(clean_lines)
-            decoded_text = base64.b64decode(clean_b64).decode('utf-8', errors='ignore')
+            try:
+                decoded_text = base64.b64decode(clean_b64).decode('utf-8', errors='ignore')
+            except Exception:
+                pass
+
+        if not decoded_text:
+            logger.error("Could not decode cookies. Make sure YOUTUBE_COOKIES_B64 is valid base64 or raw Netscape format")
+            return None
 
         with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as f:
             f.write(decoded_text)
+
+        size = os.path.getsize(COOKIES_FILE_PATH)
+        logger.info(f"Cookies file written: {size} bytes")
+
+        if size < 50:
+            logger.error("Cookies file too small! Check YOUTUBE_COOKIES_B64 content")
+            return None
+
         return COOKIES_FILE_PATH
     except Exception as e:
-        logger.warning(f"YouTube cookies decode failed: {e}")
+        logger.error(f"YouTube cookies setup failed: {e}")
         return None
 
 
@@ -243,14 +261,12 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
 
 
 def download_via_public_api(youtube_url, output_path="full_video.mp4"):
-    """يستخدم خدمات عامة لتحميل الفيديو عند حظر يوتيوب للسيرفر"""
-    import html
     api_list = [
         f"https://www.yt-download.org/api/button/mp4/{youtube_url}",
         f"https://api.vevioz.com/api/button/mp4/{youtube_url}",
     ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     for api_url in api_list:
         try:
@@ -259,63 +275,63 @@ def download_via_public_api(youtube_url, output_path="full_video.mp4"):
             if resp.status_code == 200 and len(resp.content) > 500000:
                 with open(output_path, "wb") as f:
                     f.write(resp.content)
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 500000:
-                    logger.info(f"Downloaded via public API successfully! Size: {os.path.getsize(output_path)}")
+                if os.path.getsize(output_path) > 500000:
+                    logger.info(f"Downloaded via public API! Size: {os.path.getsize(output_path)}")
                     return output_path
         except Exception as e:
-            logger.warning(f"Public API failed ({api_url}): {e}")
+            logger.warning(f"Public API failed: {e}")
     return None
 
 
 def download_video(youtube_url, output_path="full_video.mp4"):
     cookies_path = setup_youtube_cookies()
+    if cookies_path:
+        logger.info(f"Cookies file ready, size: {os.path.getsize(cookies_path)}")
 
-    client_configs = [
-        {'player_client': ['tv']},
+    strategies = [
+        {},
         {'player_client': ['ios', 'mweb']},
-        {'player_client': ['android_creator', 'tv_embedded']},
+        {'player_client': ['tv', 'tv_embedded']},
     ]
 
-    for cfg in client_configs:
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': output_path,
-            'max_filesize': 500 * 1024 * 1024,
-            'quiet': True,
-            'no_warnings': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': cfg['player_client'],
-                    'player_skip': ['webpage', 'configs'],
-                }
-            },
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-            },
-        }
-        if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-            ydl_opts['cookiefile'] = cookies_path
-
+    for idx, extra in enumerate(strategies):
         try:
-            logger.info(f"Attempting download with yt-dlp clients: {cfg['player_client']}")
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': output_path,
+                'max_filesize': 500 * 1024 * 1024,
+                'quiet': True,
+                'no_warnings': True,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+                },
+            }
+            if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+                ydl_opts['cookiefile'] = cookies_path
+            if extra:
+                ydl_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': extra['player_client'],
+                        'player_skip': ['webpage', 'configs'],
+                    }
+                }
+
+            label = f"strategy {idx+1}" + (f" ({extra['player_client']})" if extra else " (default)")
+            logger.info(f"Attempting download {label}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([youtube_url])
             if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
+                logger.info(f"Download succeeded with {label}")
                 return output_path
         except Exception as e:
-            logger.warning(f"yt-dlp attempt with {cfg['player_client']} failed: {e}")
+            logger.warning(f"Strategy {idx+1} failed: {e}")
 
-    logger.info("yt-dlp failed, trying public API fallback...")
+    logger.info("All yt-dlp strategies failed, trying public API fallback...")
     result = download_via_public_api(youtube_url, output_path)
     if result:
         return result
 
-    raise RuntimeError(
-        "فشل التحميل من يوتيوب لأن السيرفر محظور. الحل:\n"
-        "1. اذهب لهذا الرابط: https://github.com/Anarios/get-youtube-cookies\n"
-        "2. حمل الإضافة وصدّر الكوكيز\n"
-        "3. انسخ المحتوى وضعه في متغير YOUTUBE_COOKIES_B64 في Railway"
-    )
+    raise RuntimeError("فشل تحميل الفيديو من يوتيوب. تأكد من صلاحية الكوكيز وحاول مرة أخرى.")
 
 
 def seconds_to_srt_time(seconds):
