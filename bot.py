@@ -242,30 +242,86 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
     return cleaned[:num_clips]
 
 
-def download_video(youtube_url, output_path="full_video.mp4"):
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': output_path,
-        'max_filesize': 500 * 1024 * 1024,
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'mweb', 'tv_embedded', 'android'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-        }
+def download_via_cobalt(youtube_url, output_path="full_video.mp4"):
+    api_urls = [
+        "https://api.cobalt.tools/",
+        "https://cobalt-api.kwiatekm.pl/",
+    ]
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
+    payload = {
+        "url": youtube_url,
+        "videoQuality": "720",
+    }
+    for api in api_urls:
+        try:
+            res = requests.post(api, json=payload, headers=headers, timeout=20)
+            if res.status_code == 200:
+                data = res.json()
+                dl_url = data.get("url")
+                if dl_url:
+                    r = requests.get(dl_url, stream=True, timeout=120)
+                    r.raise_for_status()
+                    with open(output_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
+                        logger.info(f"Downloaded via Cobalt API ({api}) successfully!")
+                        return output_path
+        except Exception as e:
+            logger.warning(f"Cobalt download fallback failed via {api}: {e}")
+    return None
+
+
+def download_video(youtube_url, output_path="full_video.mp4"):
+    client_configs = [
+        ['ios', 'mweb'],
+        ['tv_embedded', 'android_creator'],
+        ['mweb', 'web_creator'],
+    ]
 
     cookies_path = setup_youtube_cookies()
-    if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-        ydl_opts['cookiefile'] = cookies_path
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
-    return output_path
+    for clients in client_configs:
+        ydl_opts = {
+            'format': 'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': output_path,
+            'max_filesize': 500 * 1024 * 1024,
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': clients,
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+            }
+        }
+        if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+            ydl_opts['cookiefile'] = cookies_path
+
+        try:
+            logger.info(f"Attempting download with yt-dlp clients: {clients}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([youtube_url])
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
+                return output_path
+        except Exception as e:
+            logger.warning(f"yt-dlp download attempt with clients {clients} failed: {e}")
+
+    # Fallback إلى Cobalt API إذا قام يوتيوب بحظر IP السيرفر
+    logger.info("yt-dlp blocked on datacenter IP, trying Cobalt API fallback...")
+    cobalt_res = download_via_cobalt(youtube_url, output_path)
+    if cobalt_res:
+        return cobalt_res
+
+    raise RuntimeError("فشل تحميل الفيديو من يوتيوب بسبب حظر السيرفر، يرجى المحاولة لاحقاً.")
 
 
 def seconds_to_srt_time(seconds):
