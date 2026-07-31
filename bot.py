@@ -62,14 +62,19 @@ def setup_youtube_cookies():
     if not YOUTUBE_COOKIES_B64:
         return None
     try:
-        clean_lines = [
-            line.strip() for line in YOUTUBE_COOKIES_B64.splitlines()
-            if line.strip() and not line.strip().startswith('-----')
-        ]
-        clean_b64 = "".join(clean_lines)
-        decoded = base64.b64decode(clean_b64)
-        with open(COOKIES_FILE_PATH, "wb") as f:
-            f.write(decoded)
+        content = YOUTUBE_COOKIES_B64.strip()
+        if "# Netscape HTTP Cookie File" in content or "\t" in content:
+            decoded_text = content
+        else:
+            clean_lines = [
+                line.strip() for line in content.splitlines()
+                if line.strip() and not line.strip().startswith('-----')
+            ]
+            clean_b64 = "".join(clean_lines)
+            decoded_text = base64.b64decode(clean_b64).decode('utf-8', errors='ignore')
+
+        with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(decoded_text)
         return COOKIES_FILE_PATH
     except Exception as e:
         logger.warning(f"YouTube cookies decode failed: {e}")
@@ -239,14 +244,23 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
 
 def download_video(youtube_url, output_path="full_video.mp4"):
     ydl_opts = {
-        'format': 'mp4/best',
+        'format': 'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'max_filesize': 500 * 1024 * 1024,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'mweb', 'tv_embedded', 'android'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+        }
     }
 
     cookies_path = setup_youtube_cookies()
-    if cookies_path:
+    if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
         ydl_opts['cookiefile'] = cookies_path
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
