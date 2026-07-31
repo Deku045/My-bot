@@ -242,86 +242,80 @@ def find_best_moments(segments, total_duration, num_clips, clip_duration, min_cl
     return cleaned[:num_clips]
 
 
-def download_via_cobalt(youtube_url, output_path="full_video.mp4"):
-    api_urls = [
-        "https://api.cobalt.tools/",
-        "https://cobalt-api.kwiatekm.pl/",
+def download_via_public_api(youtube_url, output_path="full_video.mp4"):
+    """يستخدم خدمات عامة لتحميل الفيديو عند حظر يوتيوب للسيرفر"""
+    import html
+    api_list = [
+        f"https://www.yt-download.org/api/button/mp4/{youtube_url}",
+        f"https://api.vevioz.com/api/button/mp4/{youtube_url}",
     ]
     headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    payload = {
-        "url": youtube_url,
-        "videoQuality": "720",
-    }
-    for api in api_urls:
+    for api_url in api_list:
         try:
-            res = requests.post(api, json=payload, headers=headers, timeout=20)
-            if res.status_code == 200:
-                data = res.json()
-                dl_url = data.get("url")
-                if dl_url:
-                    r = requests.get(dl_url, stream=True, timeout=120)
-                    r.raise_for_status()
-                    with open(output_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
-                        logger.info(f"Downloaded via Cobalt API ({api}) successfully!")
-                        return output_path
+            logger.info(f"Trying public API: {api_url}")
+            resp = requests.get(api_url, headers=headers, timeout=30, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 500000:
+                with open(output_path, "wb") as f:
+                    f.write(resp.content)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 500000:
+                    logger.info(f"Downloaded via public API successfully! Size: {os.path.getsize(output_path)}")
+                    return output_path
         except Exception as e:
-            logger.warning(f"Cobalt download fallback failed via {api}: {e}")
+            logger.warning(f"Public API failed ({api_url}): {e}")
     return None
 
 
 def download_video(youtube_url, output_path="full_video.mp4"):
-    client_configs = [
-        ['ios', 'mweb'],
-        ['tv_embedded', 'android_creator'],
-        ['mweb', 'web_creator'],
-    ]
-
     cookies_path = setup_youtube_cookies()
 
-    for clients in client_configs:
+    client_configs = [
+        {'player_client': ['tv']},
+        {'player_client': ['ios', 'mweb']},
+        {'player_client': ['android_creator', 'tv_embedded']},
+    ]
+
+    for cfg in client_configs:
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'best[ext=mp4]/best',
             'outtmpl': output_path,
             'max_filesize': 500 * 1024 * 1024,
             'quiet': True,
             'no_warnings': True,
             'extractor_args': {
                 'youtube': {
-                    'player_client': clients,
+                    'player_client': cfg['player_client'],
                     'player_skip': ['webpage', 'configs'],
                 }
             },
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-            }
+            },
         }
         if cookies_path and os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
             ydl_opts['cookiefile'] = cookies_path
 
         try:
-            logger.info(f"Attempting download with yt-dlp clients: {clients}")
+            logger.info(f"Attempting download with yt-dlp clients: {cfg['player_client']}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([youtube_url])
             if os.path.exists(output_path) and os.path.getsize(output_path) > 100000:
                 return output_path
         except Exception as e:
-            logger.warning(f"yt-dlp download attempt with clients {clients} failed: {e}")
+            logger.warning(f"yt-dlp attempt with {cfg['player_client']} failed: {e}")
 
-    # Fallback إلى Cobalt API إذا قام يوتيوب بحظر IP السيرفر
-    logger.info("yt-dlp blocked on datacenter IP, trying Cobalt API fallback...")
-    cobalt_res = download_via_cobalt(youtube_url, output_path)
-    if cobalt_res:
-        return cobalt_res
+    logger.info("yt-dlp failed, trying public API fallback...")
+    result = download_via_public_api(youtube_url, output_path)
+    if result:
+        return result
 
-    raise RuntimeError("فشل تحميل الفيديو من يوتيوب بسبب حظر السيرفر، يرجى المحاولة لاحقاً.")
+    raise RuntimeError(
+        "فشل التحميل من يوتيوب لأن السيرفر محظور. الحل:\n"
+        "1. اذهب لهذا الرابط: https://github.com/Anarios/get-youtube-cookies\n"
+        "2. حمل الإضافة وصدّر الكوكيز\n"
+        "3. انسخ المحتوى وضعه في متغير YOUTUBE_COOKIES_B64 في Railway"
+    )
 
 
 def seconds_to_srt_time(seconds):
